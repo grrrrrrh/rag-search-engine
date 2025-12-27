@@ -1,9 +1,7 @@
 [project]
 name = "rag-search-engine"
 version = "0.1.0"
-description = "Add your description here"
+description = "learning the basics of RAG for personal project"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "nltk==3.9.1",
-]
+dependencies = ["nltk==3.9.1"]
