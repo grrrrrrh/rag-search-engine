@@ -20,3 +20,8 @@ cache/
 cache/
 *.npy
 
+
+# caches
+cache/
+*.npy
+
