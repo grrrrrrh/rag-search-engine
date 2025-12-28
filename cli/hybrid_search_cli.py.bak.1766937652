@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+
+import argparse
+
+from lib.hybrid_search import HybridSearch
+
+
+def minmax_normalize(scores: list[float]) -> list[float]:
+    if not scores:
+        return []
+    mn = min(scores)
+    mx = max(scores)
+    if mn == mx:
+        return [1.0] * len(scores)
+    denom = mx - mn
+    return [(x - mn) / denom for x in scores]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Hybrid Search CLI")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    normalize_parser = subparsers.add_parser(
+        "normalize", help="Normalize scores using min-max normalization"
+    )
+    normalize_parser.add_argument("scores", type=float, nargs="*", help="Scores to normalize")
+
+    ws_parser = subparsers.add_parser("weighted-search", help="Hybrid search with alpha weighting")
+    ws_parser.add_argument("query", type=str, help="Search query")
+    ws_parser.add_argument("--alpha", type=float, default=0.5, help="Weighting for BM25 vs semantic")
+    ws_parser.add_argument("--limit", type=int, default=5, help="Number of results to return")
+
+    args = parser.parse_args()
+
+    match args.command:
+        case "normalize":
+            normed = minmax_normalize(args.scores)
+            for x in normed:
+                print(f"* {x:.4f}")
+
+        case "weighted-search":
+            # load docs through semantic_search module (it already knows where movies.json is)
+            from lib.semantic_search import load_movies
+
+            docs = load_movies()
+            hs = HybridSearch(docs)
+            results = hs.weighted_search(args.query, alpha=args.alpha, limit=args.limit)
+
+            for i, r in enumerate(results, 1):
+                print(f"{i}. {r['title']}")
+                print(f"   Hybrid Score: {r['hybrid']:.3f}")
+                print(f"   BM25: {r['bm25']:.3f}, Semantic: {r['semantic']:.3f}")
+                print(f"   {r['document']}")
+
+        case _:
+            parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

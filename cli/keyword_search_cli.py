@@ -2,10 +2,6 @@
 
 import argparse
 
-import sys
-from pathlib import Path as _Path
-sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
-
 from lib.keyword_search import (
     bm25_idf_command,
     bm25_tf_command,
