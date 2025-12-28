@@ -15,3 +15,8 @@ wheels/
 # local caches
 cache/
 *.npy
+
+# caches
+cache/
+*.npy
+
