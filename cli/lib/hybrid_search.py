@@ -1,167 +1,143 @@
-from __future__ import annotations
-
+import os
 from typing import Any
 
-from lib.search_utils import load_movies, format_search_result
+from lib.keyword_search import InvertedIndex
+from lib.search_utils import load_movies
 
-# Be resilient to where InvertedIndex lives in your project
-try:
-    from lib.keyword_search import InvertedIndex
-except Exception:  # pragma: no cover
-    from inverted_index import InvertedIndex  # type: ignore
 
-try:
-    from lib.semantic_search import ChunkedSemanticSearch
-except Exception:  # pragma: no cover
-    from semantic_search import ChunkedSemanticSearch  # type: ignore
+def _dbg(msg: str) -> None:
+    if os.getenv("DEBUG_RAG", ""):
+        print(f"[DEBUG] {msg}")
 
 
 def normalize_scores(scores: list[float]) -> list[float]:
-    """Min-max normalize scores to [0,1]. If all equal, return all 1.0."""
     if not scores:
         return []
-    lo = min(scores)
-    hi = max(scores)
-    if hi == lo:
+    mn = min(scores)
+    mx = max(scores)
+    if mx == mn:
         return [1.0 for _ in scores]
-    rng = hi - lo
-    return [(s - lo) / rng for s in scores]
+    span = mx - mn
+    return [(s - mn) / span for s in scores]
 
 
 def rrf_score(rank: int, k: int = 60) -> float:
-    # rank is 1-based
-    return 1.0 / (k + rank)
+    return 1.0 / float(k + rank)
 
 
 class HybridSearch:
-    def __init__(self, documents: list[dict] | None = None) -> None:
-        self.documents = documents or load_movies()
-        self.doc_by_id: dict[int, dict] = {int(d["id"]): d for d in self.documents}
+    def __init__(self) -> None:
+        self._movies = load_movies()
+        self._docmap: dict[int, dict[str, Any]] = {int(m["id"]): m for m in self._movies}
+        self._idx: InvertedIndex | None = None
 
-        # Load chunk embeddings (cached if present)
-        self.semantic = ChunkedSemanticSearch()
-        self.semantic.load_or_create_chunk_embeddings(self.documents)
+        # Chunked semantic search object is created lazily so that commands that
+        # only need BM25 don't pay the embedding load cost.
+        self._chunk_search: Any | None = None
 
-        # Load BM25 index (must exist from earlier build step)
-        # Load BM25 index whether load() is a classmethod OR an instance method
-        try:
-            self.idx = InvertedIndex.load()
-        except TypeError:
-            idx = InvertedIndex()
-            rv = idx.load()
-            self.idx = rv if isinstance(rv, InvertedIndex) else idx
+    def _get_idx(self) -> InvertedIndex:
+        if self._idx is None:
+            _dbg("Loading InvertedIndex from cache...")
+            self._idx = InvertedIndex.load()
+        return self._idx
 
+    def _get_chunk_search(self):
+        if self._chunk_search is None:
+            _dbg("Loading ChunkedSemanticSearch + chunk embeddings...")
+            from lib.semantic_search import ChunkedSemanticSearch
+
+            ss = ChunkedSemanticSearch()
+            ss.load_or_create_chunk_embeddings(self._movies)
+            self._chunk_search = ss
+        return self._chunk_search
 
     def _bm25_search(self, query: str, limit: int) -> list[dict[str, Any]]:
-        raw = self.idx.bm25_search(query, limit=limit)
+        idx = self._get_idx()
+        return idx.bm25_search(query, limit=limit)
 
+    def _semantic_search(self, query: str, limit: int) -> list[dict[str, Any]]:
+        ss = self._get_chunk_search()
+        # support either method name depending on your earlier steps
+        if hasattr(ss, "search"):
+            return ss.search(query, limit=limit)
+        return ss.search_chunks(query, limit=limit)
+
+    def weighted_search(self, query: str, alpha: float = 0.5, limit: int = 5) -> list[dict[str, Any]]:
+        alpha = max(0.0, min(1.0, float(alpha)))
+        big_limit = max(limit * 500, limit)
+
+        bm25 = self._bm25_search(query, big_limit)
+        sem = self._semantic_search(query, big_limit)
+
+        bm_map = {int(d["id"]): float(d.get("score", 0.0)) for d in bm25}
+        se_map = {int(d["id"]): float(d.get("score", 0.0)) for d in sem}
+
+        cand = sorted(set(bm_map.keys()) | set(se_map.keys()))
+        bm_vals = [bm_map.get(i, 0.0) for i in cand]
+        se_vals = [se_map.get(i, 0.0) for i in cand]
+
+        bm_norm = dict(zip(cand, normalize_scores(bm_vals)))
+        se_norm = dict(zip(cand, normalize_scores(se_vals)))
+
+        combined: list[tuple[int, float]] = []
+        for doc_id in cand:
+            score = alpha * bm_norm.get(doc_id, 0.0) + (1.0 - alpha) * se_norm.get(doc_id, 0.0)
+            combined.append((doc_id, score))
+
+        combined.sort(key=lambda kv: (-kv[1], kv[0]))
         out: list[dict[str, Any]] = []
-        for item in raw:
-            # support either [(doc_id, score), ...] or [{"id":..,"score":..}, ...]
-            if isinstance(item, dict):
-                doc_id = int(item["id"])
-                score = float(item["score"])
-            else:
-                doc_id = int(item[0])
-                score = float(item[1])
-
-            doc = self.doc_by_id.get(doc_id)
-            if not doc:
-                continue
-
+        for doc_id, score in combined[:limit]:
+            doc = self._docmap.get(int(doc_id), {})
             out.append(
-                format_search_result(
-                    str(doc_id),
-                    doc.get("title", ""),
-                    doc.get("description", "") or "",
-                    score,
-                )
+                {
+                    "id": str(doc_id),
+                    "title": doc.get("title", ""),
+                    "document": (doc.get("description", "") or ""),
+                    "score": float(score),
+                }
             )
         return out
 
-    def _semantic_search(self, query: str, limit: int) -> list[dict[str, Any]]:
-        # Some projects call it search_chunks, some call it search; support both.
-        if hasattr(self.semantic, "search_chunks"):
-            return self.semantic.search_chunks(query, limit=limit)  # type: ignore[attr-defined]
-        return self.semantic.search(query, limit=limit)  # type: ignore[attr-defined]
-
-    def weighted_search(self, query: str, alpha: float = 0.5, limit: int = 5) -> list[dict[str, Any]]:
-        big_limit = max(1, limit * 500)
+    def rrf_search(self, query: str, k: int = 60, limit: int = 5) -> list[dict[str, Any]]:
+        k = int(k)
+        big_limit = max(limit * 500, limit)
 
         bm25 = self._bm25_search(query, big_limit)
         sem = self._semantic_search(query, big_limit)
 
-        bm25_scores = [float(r["score"]) for r in bm25]
-        sem_scores = [float(r["score"]) for r in sem]
+        bm_rank: dict[int, int] = {}
+        for i, d in enumerate(bm25, 1):
+            bm_rank[int(d["id"])] = i
 
-        bm25_norm = normalize_scores(bm25_scores)
-        sem_norm = normalize_scores(sem_scores)
+        se_rank: dict[int, int] = {}
+        for i, d in enumerate(sem, 1):
+            se_rank[int(d["id"])] = i
 
-        bm25_by_id = {int(r["id"]): (r, bm25_norm[i]) for i, r in enumerate(bm25)}
-        sem_by_id = {int(r["id"]): (r, sem_norm[i]) for i, r in enumerate(sem)}
+        all_ids = set(bm_rank.keys()) | set(se_rank.keys())
 
-        all_ids = set(bm25_by_id.keys()) | set(sem_by_id.keys())
-
-        combined: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for doc_id in all_ids:
-            bm25_r, b = bm25_by_id.get(doc_id, (None, 0.0))
-            sem_r, s = sem_by_id.get(doc_id, (None, 0.0))
+            score = 0.0
+            br = bm_rank.get(doc_id)
+            sr = se_rank.get(doc_id)
+            if br is not None:
+                score += rrf_score(br, k=k)
+            if sr is not None:
+                score += rrf_score(sr, k=k)
 
-            base = sem_r or bm25_r
-            if base is None:
-                continue
-
-            combined_score = alpha * b + (1.0 - alpha) * s
-            combined.append(
+            doc = self._docmap.get(int(doc_id), {})
+            results.append(
                 {
                     "id": str(doc_id),
-                    "title": base["title"],
-                    "document": base.get("document", ""),
-                    "score": combined_score,
+                    "title": doc.get("title", ""),
+                    "document": (doc.get("description", "") or ""),
+                    "rrf_score": float(score),
+                    "bm25_rank": br,
+                    "semantic_rank": sr,
                 }
             )
 
-        combined.sort(key=lambda r: (-float(r["score"]), int(r["id"])))
-        return combined[:limit]
-
-    def rrf_search(self, query: str, k: int = 60, limit: int = 5) -> list[dict[str, Any]]:
-        big_limit = max(1, limit * 500)
-
-        bm25 = self._bm25_search(query, big_limit)
-        sem = self._semantic_search(query, big_limit)
-
-        merged: dict[int, dict[str, Any]] = {}
-
-        # BM25 ranks
-        for i, r in enumerate(bm25, start=1):
-            doc_id = int(r["id"])
-            if doc_id not in merged:
-                merged[doc_id] = {
-                    "id": str(doc_id),
-                    "title": r["title"],
-                    "document": r.get("document", ""),
-                    "bm25_rank": i,
-                    "semantic_rank": None,
-                    "rrf_score": 0.0,
-                }
-            merged[doc_id]["bm25_rank"] = i
-            merged[doc_id]["rrf_score"] += rrf_score(i, k=k)
-
-        # Semantic ranks
-        for i, r in enumerate(sem, start=1):
-            doc_id = int(r["id"])
-            if doc_id not in merged:
-                merged[doc_id] = {
-                    "id": str(doc_id),
-                    "title": r["title"],
-                    "document": r.get("document", ""),
-                    "bm25_rank": None,
-                    "semantic_rank": i,
-                    "rrf_score": 0.0,
-                }
-            merged[doc_id]["semantic_rank"] = i
-            merged[doc_id]["rrf_score"] += rrf_score(i, k=k)
-
-        results = list(merged.values())
-        results.sort(key=lambda r: (-float(r["rrf_score"]), int(r["id"])))
+        results.sort(key=lambda d: (-d["rrf_score"], int(d["id"])))
+        for i, d in enumerate(results, 1):
+            d["rrf_rank"] = i
         return results[:limit]

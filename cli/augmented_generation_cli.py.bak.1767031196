@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Any
+
+from dotenv import load_dotenv
+from google import genai
+
+from lib.search_utils import load_movies
+
+
+def _get_api_key() -> str | None:
+    # Support common env var names
+    return (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GENAI_API_KEY")
+    )
+
+
+def _get_client() -> genai.Client:
+    load_dotenv()
+    api_key = _get_api_key()
+    if not api_key:
+        # Don't crash the whole CLI; summarization just won't be available.
+        raise RuntimeError(
+            "Missing Gemini API key. Set GEMINI_API_KEY (or GOOGLE_API_KEY / GENAI_API_KEY)."
+        )
+    return genai.Client(api_key=api_key)
+
+
+def _pick_model() -> str:
+    # Allow overrides, but provide sensible fallbacks.
+    # (Different environments/projects may have different model availability.)
+    return os.getenv("GEMINI_MODEL") or "gemini-1.5-flash"
+
+
+def summarize_with_gemini(query: str, results: list[dict[str, Any]]) -> str:
+    # Build a compact but information-rich "results" block for the LLM.
+    # Include title + short description so it can synthesize across docs.
+    lines: list[str] = []
+    for r in results:
+        title = str(r.get("title", "")).strip()
+        doc = str(r.get("document", "")).strip()
+        if not title:
+            continue
+        if doc:
+            # Keep prompt size reasonable
+            doc = doc.replace("\n", " ")
+            if len(doc) > 350:
+                doc = doc[:350].rstrip() + "..."
+            lines.append(f"- {title}: {doc}")
+        else:
+            lines.append(f"- {title}")
+
+    results_block = "\n".join(lines)
+
+    prompt = f"""
+Provide information useful to this query by synthesizing information from multiple search results in detail.
+The goal is to provide comprehensive information so that users know what their options are.
+Your response should be information-dense and concise, with several key pieces of information about the genre, plot, etc. of each movie.
+This should be tailored to Hoopla users. Hoopla is a movie streaming service.
+Query: {query}
+Search Results:
+{results_block}
+Provide a comprehensive 3–4 sentence answer that combines information from multiple sources:
+""".strip()
+
+    client = _get_client()
+
+    # Try chosen model first; if it fails due to model name mismatch, try a couple common fallbacks.
+    model_candidates = [ _pick_model(), "gemini-1.5-pro", "gemini-1.5-flash-001" ]
+    last_err: Exception | None = None
+
+    for model in model_candidates:
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            text = getattr(resp, "text", None)
+            if text:
+                return str(text).strip()
+            # Fallback if .text isn't present for some reason
+            return str(resp).strip()
+        except Exception as e:
+            last_err = e
+            continue
+
+    # If everything failed, surface a helpful message without crashing the CLI.
+    return f"(LLM summary unavailable: {last_err})"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Augmented Generation CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    summarize_parser = subparsers.add_parser("summarize", help="Summarize RRF search results with an LLM")
+    summarize_parser.add_argument("query", type=str, help="Search query")
+    summarize_parser.add_argument("--limit", type=int, default=5, help="Number of results")
+
+    args = parser.parse_args()
+
+    if args.command == "summarize":
+        # Import here so the file can still run help/parse even if hybrid stack is mid-refactor
+        from lib.hybrid_search import HybridSearch
+
+        movies = load_movies()
+        hs = HybridSearch()
+        results = hs.rrf_search(args.query, k=60, limit=args.limit)
+
+        print("Search Results:")
+        for r in results:
+            print(f"  - {r['title']}")
+
+        print("\nLLM Summary:")
+        try:
+            summary = summarize_with_gemini(args.query, results)
+        except Exception as e:
+            summary = f"(LLM summary unavailable: {e})"
+        print(summary)
+
+
+if __name__ == "__main__":
+    main()
