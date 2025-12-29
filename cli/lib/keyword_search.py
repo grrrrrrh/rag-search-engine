@@ -18,6 +18,45 @@ from .search_utils import (
 
 
 class InvertedIndex:
+    @classmethod
+    @classmethod
+    def load(cls):
+        """Load an index instance from cache/* files."""
+        import pickle
+        from pathlib import Path
+
+        idx_path = Path("cache") / "index.pkl"
+        docmap_path = Path("cache") / "docmap.pkl"
+        tf_path = Path("cache") / "term_frequencies.pkl"
+        dl_path = Path("cache") / "doc_lengths.pkl"
+
+        for p in (idx_path, docmap_path, tf_path):
+            if not p.exists():
+                raise FileNotFoundError(f"Missing cache file: {p}")
+
+        self = cls()
+
+        if os.getenv("DEBUG_RAG"):
+            print("[DEBUG_RAG] InvertedIndex.load(): created instance", type(self))
+        with idx_path.open("rb") as f:
+            self.index = pickle.load(f)
+        with docmap_path.open("rb") as f:
+            self.docmap = pickle.load(f)
+        with tf_path.open("rb") as f:
+            self.term_frequencies = pickle.load(f)
+
+        # doc_lengths is needed for BM25. Load if present, otherwise derive.
+        if dl_path.exists():
+            with dl_path.open("rb") as f:
+                self.doc_lengths = pickle.load(f)
+        else:
+            try:
+                self.doc_lengths = {int(d): sum(c.values()) for d, c in self.term_frequencies.items()}
+            except Exception:
+                self.doc_lengths = {}
+
+        return self
+
     def __init__(self) -> None:
         self.index = defaultdict(set)
         self.docmap: dict[int, dict] = {}
@@ -47,7 +86,18 @@ class InvertedIndex:
         with open(self.doc_lengths_path, "wb") as f:
             pickle.dump(self.doc_lengths, f)
 
-    def load(self) -> None:
+    @classmethod
+    def load(cls, *args, **kwargs):
+        self = cls()
+        self._load(*args, **kwargs)
+        return self
+
+    def _load(cls):
+        idx = cls()
+        idx._load()
+        return idx
+
+    def _load(self) -> None:
         with open(self.index_path, "rb") as f:
             self.index = pickle.load(f)
         with open(self.docmap_path, "rb") as f:
